@@ -1,0 +1,20 @@
+[package]
+name = "mrmw-kvcache"
+version = "0.1.0"
+edition = "2021"
+description = "Lock-free multi-reader / multi-writer ring buffer (seqlock-tagged slots) that lives in shared memory across processes"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[features]
+default = ["shm"]
+# Cross-process backing via shm_open + mmap. Disable it (`--no-default-features`)
+# to build a pure-Rust version with no libc calls -- that's the build Miri runs.
+shm = ["dep:libc"]
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[[example]]
+name = "shm_demo"
+required-features = ["shm"]
