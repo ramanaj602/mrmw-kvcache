@@ -44,8 +44,6 @@ cargo run --release --example shm_demo     # real multi-process run
 cargo build --no-default-features          # pure-Rust build, no libc (for Miri)
 ```
 
-`cargo` is Rust's `make` + package manager; `Cargo.toml` is the Makefile.
-
 ## Using it
 
 ```rust
