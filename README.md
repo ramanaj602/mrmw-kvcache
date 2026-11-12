@@ -5,8 +5,7 @@ A lock-free, **multi-reader / multi-writer** ring buffer that lives in
 add and publish seqlock-style; readers fetch a specific position with an
 optimistic, never-blocking read.
 
-The code is written for a C programmer who is new to Rust: every Rust-only idea
-has a `C:` comment showing what you'd write in C. Pair it with the
+I know C, so this code is written in Rust so a C programmer can understand. You will see me add comments similarly. Pair it with the
 *Ring Buffer Internals* companion doc for diagrams.
 
 ## Layout
