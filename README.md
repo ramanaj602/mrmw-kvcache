@@ -5,6 +5,9 @@ A lock-free, **multi-reader / multi-writer** ring buffer that lives in
 add and publish seqlock-style; readers fetch a specific position with an
 optimistic, never-blocking read.
 
+## Why did I build this
+LLM serving is splitting into stages on different hardware. Prefill (reading the prompt) is compute-bound and decode (generating tokens) is memory-bound, so they increasingly run on separate GPUs, processes or machines. Every request’s KV cache, the model’s working memory of the prompt, has to be handed from one stage to the next, and that handoff sits directly in the path of the first token. mrmw-kvcache is a lock-free, multi-producer / multi-consumer shared-memory ring for doing that handoff. Writers never wait on readers, readers never block writers, and a reader always learns whether an entry is valid, not written yet, or overwritten. Overwritten is fine: it’s a cache, so a miss just means recomputing.
+
 I know C, so this code is written in Rust so a C programmer can understand. You will see me add comments similarly. Pair it with the
 *Ring Buffer Internals* companion doc for diagrams.
 
