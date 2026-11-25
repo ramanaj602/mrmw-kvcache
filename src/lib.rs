@@ -44,6 +44,32 @@ use std::sync::atomic::{fence, AtomicU64, Ordering};
 #[cfg(all(unix, feature = "shm"))]
 pub mod shm;
 
+// Control plane for KV-cache handoff: a ring of small descriptors, a block
+// pool for the bytes, and a prefix-hash index. See src/control.rs.
+pub mod control;
+
+/// A struct that can live in raw shared memory: plain data and atomics only,
+/// with a known size and an in-place initializer. `shm::Shared<R>` maps any
+/// `R: SharedLayout`, so the ring and the KV control plane share one wrapper.
+///
+/// C: anything you'd happily `mmap` and cast to `struct foo *`.
+///
+/// # Safety
+/// Implementors promise that `SIZE == size_of::<Self>()`, that alignment is
+/// at most 64 (mmap gives page-aligned memory), that the struct contains no
+/// pointers (each process maps it at a different address), and that
+/// `init_in_place` leaves it valid for concurrent use through `&Self`.
+pub unsafe trait SharedLayout: Sync {
+    /// Bytes to `ftruncate` and `mmap`.
+    const SIZE: usize;
+    /// Initialize fresh memory. Same contract as `RingBuffer::init_in_place`.
+    ///
+    /// # Safety
+    /// `p` must point to `SIZE` writable bytes aligned to 64 that nobody
+    /// else touches until this returns.
+    unsafe fn init_in_place(p: *mut Self);
+}
+
 /// Tag value of a slot that has never been written: 0xFFFF_FFFF_FFFF_FFFE.
 ///
 /// It is even (bit 0 clear), so writers don't mistake it for "busy".
@@ -355,6 +381,16 @@ impl<T: Copy + Send, const N: usize> RingBuffer<T, N> {
     /// The next position a writer will claim (= number of pushes started).
     pub fn write_cursor(&self) -> u64 {
         self.write_cursor.load(Ordering::Acquire)
+    }
+}
+
+// The ring is shareable as long as T is plain data.
+unsafe impl<T: Copy + Send, const N: usize> SharedLayout for RingBuffer<T, N> {
+    const SIZE: usize = std::mem::size_of::<Self>();
+    unsafe fn init_in_place(p: *mut Self) {
+        // Calls the inherent `RingBuffer::init_in_place` above (inherent
+        // methods win over trait methods with the same name).
+        unsafe { Self::init_in_place(p) }
     }
 }
 

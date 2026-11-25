@@ -1,37 +1,48 @@
-//! Cross-process backing: a `RingBuffer` living in a POSIX shared-memory
+//! Cross-process backing: a `RingBuffer` (or any other `SharedLayout`
+//! struct, such as the KV control plane) living in a POSIX shared-memory
 //! object. These are the exact libc calls you'd make in C
 //! (shm_open, ftruncate, mmap, munmap, shm_unlink), called through the
 //! `libc` crate, which is just Rust declarations of the C functions.
 //!
-//! Usage: exactly ONE process calls `SharedRing::create(name)`. Other
-//! processes call `SharedRing::open(name)` only after `create` has returned,
-//! because `create` is what initializes the ring.
+//! Usage: exactly ONE process calls `SharedRing::create(name)` (or
+//! `SharedControlPlane::create`). Other processes call `open(name)` only
+//! after `create` has returned, because `create` is what initializes it.
 
-use crate::RingBuffer;
+use crate::control::KvControlPlane;
+use crate::{RingBuffer, SharedLayout};
 use std::ffi::CString;
 use std::io;
 
-/// A handle to a ring mapped from a named shared-memory object.
+/// A handle to an `R` mapped from a named shared-memory object.
 ///
 /// C:
 /// ```c
 /// typedef struct {
-///     ring_t *ring;     /* where mmap put it in THIS process */
-///     char   *name;     /* "/my-ring" */
-///     bool    owner;    /* true in the process that created it */
-/// } shared_ring_t;
+///     void *region;     /* where mmap put it in THIS process */
+///     char *name;       /* "/my-ring" */
+///     bool  owner;      /* true in the process that created it */
+/// } shared_t;
 /// ```
-pub struct SharedRing<T: Copy + Send, const N: usize> {
-    ring: *mut RingBuffer<T, N>,
+pub struct Shared<R: SharedLayout> {
+    region: *mut R,
     name: CString, // a NUL-terminated C string, freed automatically
     owner: bool,
 }
 
+/// The original name, kept so existing code keeps compiling:
+/// `SharedRing<T, N>` is `Shared<RingBuffer<T, N>>`.
+pub type SharedRing<T, const N: usize> = Shared<RingBuffer<T, N>>;
+
+/// A KV control plane (descriptor ring + prefix index + block pool) in
+/// shared memory. See `crate::control`.
+pub type SharedControlPlane<const N: usize, const M: usize, const BLOCKS: usize, const BLOCK_BYTES: usize> =
+    Shared<KvControlPlane<N, M, BLOCKS, BLOCK_BYTES>>;
+
 // Raw pointers aren't shareable across threads by default in Rust; we
-// promise it's fine here because the thing they point at (RingBuffer) is
-// built for concurrent use.
-unsafe impl<T: Copy + Send, const N: usize> Send for SharedRing<T, N> {}
-unsafe impl<T: Copy + Send, const N: usize> Sync for SharedRing<T, N> {}
+// promise it's fine here because `SharedLayout` types are built for
+// concurrent use through `&R`.
+unsafe impl<R: SharedLayout> Send for Shared<R> {}
+unsafe impl<R: SharedLayout> Sync for Shared<R> {}
 
 /// Turn "my-ring" into the C string "/my-ring" that shm_open wants.
 fn make_shm_name(name: &str) -> io::Result<CString> {
@@ -52,12 +63,12 @@ fn make_shm_name(name: &str) -> io::Result<CString> {
 // `io::Result<X>` = Result<X, io::Error>: either Ok(X) or Err(an errno-style
 // error). `io::Error::last_os_error()` reads `errno` for you.
 
-impl<T: Copy + Send, const N: usize> SharedRing<T, N> {
-    /// Create, size, map and initialize a new shared ring.
+impl<R: SharedLayout> Shared<R> {
+    /// Create, size, map and initialize a new shared object.
     /// Fails with AlreadyExists (EEXIST) if the name is taken.
     pub fn create(name: &str) -> io::Result<Self> {
         let cname: CString = make_shm_name(name)?; // `?` = "if error, return it"
-        let size: usize = RingBuffer::<T, N>::SIZE;
+        let size: usize = R::SIZE;
 
         unsafe {
             // C: int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
@@ -95,19 +106,19 @@ impl<T: Copy + Send, const N: usize> SharedRing<T, N> {
             }
 
             // mmap returns page-aligned memory, so align(64) is satisfied.
-            let ring = p as *mut RingBuffer<T, N>;
-            RingBuffer::init_in_place(ring);
+            let region = p as *mut R;
+            R::init_in_place(region);
 
-            Ok(SharedRing { ring, name: cname, owner: true })
+            Ok(Shared { region, name: cname, owner: true })
         }
     }
 
-    /// Map an existing ring created by another process with the same T and N.
-    /// Refuses (InvalidData) if the object's size doesn't match
-    /// `RingBuffer::<T, N>::SIZE` -- catches most T/N mismatches.
+    /// Map an existing object created by another process with the same `R`
+    /// (same T and N for a ring). Refuses (InvalidData) if the object's size
+    /// doesn't match `R::SIZE` -- catches most type/parameter mismatches.
     pub fn open(name: &str) -> io::Result<Self> {
         let cname: CString = make_shm_name(name)?;
-        let size: usize = RingBuffer::<T, N>::SIZE;
+        let size: usize = R::SIZE;
 
         unsafe {
             // C: int fd = shm_open(name, O_RDWR, 0);
@@ -131,8 +142,8 @@ impl<T: Copy + Send, const N: usize> SharedRing<T, N> {
             if actual < size || actual > rounded {
                 libc::close(fd);
                 let msg = format!(
-                    "shm object is {actual} bytes, expected {size} for RingBuffer<{}, {N}>",
-                    std::any::type_name::<T>()
+                    "shm object is {actual} bytes, expected {size} for {}",
+                    std::any::type_name::<R>()
                 );
                 return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
             }
@@ -151,7 +162,7 @@ impl<T: Copy + Send, const N: usize> SharedRing<T, N> {
                 return Err(mmap_err);
             }
 
-            Ok(SharedRing { ring: p as *mut RingBuffer<T, N>, name: cname, owner: false })
+            Ok(Shared { region: p as *mut R, name: cname, owner: false })
         }
     }
 
@@ -165,21 +176,29 @@ impl<T: Copy + Send, const N: usize> SharedRing<T, N> {
         Ok(())
     }
 
-    /// Borrow the ring so you can call `push` / `read_at` on it.
-    /// C: `ring_t *ring(shared_ring_t *s) { return s->ring; }`
-    pub fn ring(&self) -> &RingBuffer<T, N> {
+    /// Borrow the shared object.
+    /// C: `void *get(shared_t *s) { return s->region; }`
+    pub fn get(&self) -> &R {
         // Safe because the mapping lives exactly as long as `self`.
-        unsafe { &*self.ring }
+        unsafe { &*self.region }
+    }
+}
+
+impl<T: Copy + Send, const N: usize> Shared<RingBuffer<T, N>> {
+    /// Borrow the ring so you can call `push` / `read_at` on it.
+    /// (Same as `get()`; kept so existing callers don't change.)
+    pub fn ring(&self) -> &RingBuffer<T, N> {
+        self.get()
     }
 }
 
 /// `Drop` is a destructor: it runs automatically when a SharedRing goes out
 /// of scope, the way you'd call `shared_ring_close(&s)` by hand in C.
-impl<T: Copy + Send, const N: usize> Drop for SharedRing<T, N> {
+impl<R: SharedLayout> Drop for Shared<R> {
     fn drop(&mut self) {
         unsafe {
-            // C: munmap(s->ring, sizeof(ring_t)); if (s->owner) shm_unlink(s->name);
-            libc::munmap(self.ring as *mut libc::c_void, RingBuffer::<T, N>::SIZE);
+            // C: munmap(s->region, sizeof(R)); if (s->owner) shm_unlink(s->name);
+            libc::munmap(self.region as *mut libc::c_void, R::SIZE);
             if self.owner {
                 libc::shm_unlink(self.name.as_ptr());
             }
