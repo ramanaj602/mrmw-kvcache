@@ -15,9 +15,11 @@ I know C, so this code is written in Rust so a C programmer can understand. You 
 
 ```
 src/lib.rs           RingBuffer<T, N>: init_in_place, new_boxed, push, read_at
-src/shm.rs           SharedRing: shm_open + ftruncate + mmap wrapper (Unix)
+src/control.rs       KvControlPlane: descriptor ring + prefix index + block pool
+src/shm.rs           Shared<R>: shm_open + ftruncate + mmap wrapper (Unix)
 tests/stress.rs      8 writers x 200k pushes, 4 readers checking for torn reads
 tests/shm.rs         two mappings of one shm object see each other's writes
+tests/control.rs     concurrent publish/get under block reuse; plane in shm
 examples/shm_demo.rs 1 writer process + 3 reader processes over real shm
 ```
 
@@ -66,6 +68,55 @@ match shared.ring().read_at(pos) {
     Err(e)    => { /* NotYetWritten | Evicted | Contended */ }
 }
 ```
+
+## Control plane: KV block handoff
+
+KV blocks are megabytes and usually live in GPU memory, so copying them
+through ring slots is the wrong shape. `control::KvControlPlane` keeps the
+ring for what it's good at -- small, lock-free notifications -- and moves the
+bytes elsewhere:
+
+```
+prefill:  pool.write(bytes) -> (block, gen)  ->  descs.push(KvDesc)  ->  index.insert(prefix_hash, pos)
+decode:   index.lookup(prefix_hash) -> pos   ->  descs.read_at(pos)  ->  pool.read(block, gen)
+```
+
+* **Descriptor ring** (`RingBuffer<KvDesc, N>`): 40-byte descriptors saying
+  which prefix, which layers, which device, which block and which generation.
+* **Block pool**: fixed-size blocks handed out round-robin. Each block has a
+  generation counter (even = stable, odd = being written), so a reader
+  holding an old descriptor sees `Stale` instead of someone else's KV.
+* **Prefix index**: a lock-free hash table from prefix hash to the newest
+  descriptor, so decode can reuse KV for a prompt prefix it has seen before.
+
+Every race turns into a miss (recompute), never into wrong data: `lookup`
+checks that the descriptor carries the requested hash, and `fetch` checks
+the block's generation before and after copying.
+
+```rust
+use mrmw_kvcache::control::KvMeta;
+use mrmw_kvcache::shm::SharedControlPlane;
+
+// 1024 descriptors, 2048 index entries, 1024 blocks of 64 KiB
+type Plane = SharedControlPlane<1024, 2048, 1024, 65536>;
+
+let prefill = Plane::create("kv-plane")?;          // one process
+let meta = KvMeta { request_id: 1, prefix_hash: h, layer_start: 0, layer_end: 32,
+                    device: 0, dtype_layout: 1 };
+prefill.get().publish(meta, &kv_bytes)?;
+
+let decode = Plane::open("kv-plane")?;             // another process
+let mut buf = vec![0u8; 65536];
+match decode.get().get(h, &mut buf) {
+    Ok((desc, n)) => { /* reuse buf[..n] */ }
+    Err(_) => { /* miss: run prefill */ }
+}
+```
+
+In a real deployment the block pool is the part you replace (GPU or pinned
+memory, or an RDMA region named by `device` + `block`). The descriptor ring,
+the generation check and the index stay the same. `SharedRing<T, N>` still
+works as before; it is now an alias for `Shared<RingBuffer<T, N>>`.
 
 ## Changes from the original design doc
 
